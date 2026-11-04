@@ -1,0 +1,3 @@
+[submodule "skills/ste-zht"]
+	path = skills/ste-zht
+	url = https://github.com/dualface/ste-zht.git
