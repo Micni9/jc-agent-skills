@@ -1,5 +1,5 @@
 ---
-name: Todo Tracking
+name: todo-tracking
 description: 把工作中發現但未處理的問題記錄到專案根目錄的 TODO.md，並用腳本做 CRUD。當你發現 bug、風險、規格矛盾、待確認事項、技術債，或使用者說「先記下來」「之後再處理」「記錄 TODO」「列出現有 TODO」「關閉/刪除 TODO 項目」時使用。Log unhandled issues discovered during work into the project TODO.md with a script for create, list, update, close, and delete.
 ---
 
