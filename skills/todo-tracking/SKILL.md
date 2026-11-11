@@ -34,7 +34,7 @@ description: 把工作中發現但未處理的問題記錄到專案根目錄的 
 
 ## 流程
 
-1. 確認目標檔案：執行 `path`，看 `TODO.md` 會落在哪個目錄（預設是最近的 `.git` 上層目錄）。
+1. 確認目標檔案：執行 `path`，看 `TODO.md` 會落在哪個目錄（預設依專案標記向上尋找，見下方「專案根目錄偵測」）。
 2. 查重：`list -Status all`。
 3. 決定優先級（見下表）。
 4. 用 `add` 寫入，至少給 `-Title` 與 `-Location`，`-Note` 說明現象與為什麼是問題。
@@ -53,7 +53,9 @@ description: 把工作中發現但未處理的問題記錄到專案根目錄的 
 
 ## 腳本
 
-位置：`scripts/todo.ps1`（相對於本 SKILL.md）。
+位置：`scripts/todo.ps1` 與 `scripts/todo.mjs`（相對於本 SKILL.md）。
+
+`todo.ps1` 適用 PowerShell 5.1+ / pwsh 7+；`todo.mjs` 為跨平台版本（Node.js 18+，無外部依賴），兩者共用同一份 `TODO.md`，可交錯編輯。
 
 ```powershell
 $todo = "$HOME/.config/opencode/skills/todo-tracking/scripts/todo.ps1"
@@ -65,7 +67,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File $todo <command> [args]
 pwsh -NoProfile -ExecutionPolicy Bypass -File $todo <command> [args]
 ```
 
-Windows 以外或沒有 PowerShell 時，直接依下方格式手動編輯 `TODO.md`。
+```bash
+# Node.js 18+（Linux / macOS / Windows 皆可）
+node "$HOME/.config/opencode/skills/todo-tracking/scripts/todo.mjs" <command> [args]
+```
+
+Windows 以外或沒有 PowerShell 時，可用 `todo.mjs`（需 Node.js 18+）；兩者皆無時，直接依下方格式手動編輯 `TODO.md`。
 
 ### 指令
 
@@ -94,6 +101,31 @@ Windows 以外或沒有 PowerShell 時，直接依下方格式手動編輯 `TODO
 - `-Json`：`list` 輸出 JSON 陣列，方便程式處理。
 
 `add` 會自動填 `發現` 為當天日期；`done` 會填 `完成`。ID 取現有最大值加一。
+
+### 專案根目錄偵測
+
+`TODO.md` 的位置依下列順序決定，第一個命中的為準：
+
+| 順序 | 來源 | 說明 |
+| --- | --- | --- |
+| 1 | `-TodoFile <路徑>` | 直接指定檔案；相對路徑以目前目錄為基準 |
+| 2 | 環境變數 `TODO_FILE` | 同上；空字串或全空白視為未設定 |
+| 3 | 環境變數 `TODO_ROOT` | 指定專案根目錄，檔案為 `<TODO_ROOT>/TODO.md` |
+| 4 | 專案標記 | 從目前目錄往上，最近的含標記目錄 |
+| 5 | 目前目錄 | 都沒有標記時的後備，不報錯 |
+
+專案標記（任一即算，`.git` 是檔案也算，例如 worktree）：
+
+`.git`、`package.json`、`pyproject.toml`、`setup.py`、`go.mod`、`Cargo.toml`、`pom.xml`、`build.gradle`、`*.sln`、`*.csproj`、`composer.json`、`Gemfile`
+
+```powershell
+$env:TODO_ROOT = "C:\repo\my-project"      # TODO.md 放到 C:\repo\my-project\TODO.md
+$env:TODO_FILE = "C:\repo\docs\TODO.md"    # 直接指定檔案，優先於 TODO_ROOT
+```
+
+### 檔案編碼
+
+`TODO.md` 一律以 UTF-8（無 BOM）、LF 換行寫入；讀取時接受 CRLF 與 BOM。寫入採原子替換（同目錄暫存檔 + rename），中斷不會留下半寫檔案。
 
 ## TODO.md 格式
 

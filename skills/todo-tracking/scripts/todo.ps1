@@ -75,23 +75,56 @@ $Template = @(
     ''
 )
 
+# 專案根目錄標記；順序只決定哪個標記命中，不影響結果路徑。
+$MarkerNames = @('.git', 'package.json', 'pyproject.toml', 'setup.py', 'go.mod', 'Cargo.toml', 'pom.xml', 'build.gradle', 'composer.json', 'Gemfile')
+$MarkerSuffixes = @('.sln', '.csproj')
+
+function Test-MarkerDirectory {
+    param([string]$Directory)
+
+    foreach ($name in $MarkerNames) {
+        if (Test-Path -LiteralPath (Join-Path $Directory $name)) { return $true }
+    }
+    try {
+        foreach ($file in [System.IO.Directory]::GetFiles($Directory)) {
+            $leaf = [System.IO.Path]::GetFileName($file)
+            foreach ($suffix in $MarkerSuffixes) {
+                if ($leaf.EndsWith($suffix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+            }
+        }
+    } catch {
+        # 目錄不可列舉時（例如權限不足），glob 標記視為未命中，不中斷整體流程。
+    }
+    return $false
+}
+
+# 解析順序：
+#   -TodoFile > TODO_FILE > TODO_ROOT > 標記向上尋找 > 目前目錄
 function Resolve-TodoPath {
     param([string]$Override)
 
-    if (-not [string]::IsNullOrWhiteSpace($Override)) {
-        if ([System.IO.Path]::IsPathRooted($Override)) {
-            return [System.IO.Path]::GetFullPath($Override)
+    $candidate = $Override
+    if ([string]::IsNullOrWhiteSpace($candidate)) { $candidate = $env:TODO_FILE }
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+        if ([System.IO.Path]::IsPathRooted($candidate)) {
+            return [System.IO.Path]::GetFullPath($candidate)
         }
-        return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $Override))
+        return [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $candidate))
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($env:TODO_ROOT)) {
+        $rootPath = $env:TODO_ROOT
+        if (-not [System.IO.Path]::IsPathRooted($rootPath)) {
+            $rootPath = Join-Path (Get-Location).Path $rootPath
+        }
+        return [System.IO.Path]::GetFullPath((Join-Path $rootPath 'TODO.md'))
     }
 
     $start = (Get-Location).Path
-    $root = $start
     $probe = $start
     while (-not [string]::IsNullOrWhiteSpace($probe)) {
-        if (Test-Path -LiteralPath (Join-Path $probe '.git')) {
-            $root = $probe
-            break
+        if (Test-MarkerDirectory -Directory $probe) {
+            return (Join-Path $probe 'TODO.md')
         }
         $parent = [System.IO.Path]::GetDirectoryName($probe)
         if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probe) {
@@ -99,7 +132,38 @@ function Resolve-TodoPath {
         }
         $probe = $parent
     }
-    return (Join-Path $root 'TODO.md')
+    return (Join-Path $start 'TODO.md')
+}
+
+# 統一寫入：UTF-8（無 BOM）、LF、原子替換（同目錄暫存檔 + Replace/Move）。
+function Write-TodoText {
+    param([string]$Path, [string]$Text)
+
+    $directory = [System.IO.Path]::GetDirectoryName($Path)
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
+        [void](New-Item -ItemType Directory -Path $directory -Force)
+    }
+
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    $tmp = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    $backup = Join-Path $directory ([System.IO.Path]::GetRandomFileName())
+    try {
+        [System.IO.File]::WriteAllText($tmp, $Text, $encoding)
+        if (Test-Path -LiteralPath $Path) {
+            # 3 參數 Replace 需要實際的備份檔名（$null 會被轉成空字串而失敗）。
+            [System.IO.File]::Replace($tmp, $Path, $backup)
+        }
+        else {
+            [System.IO.File]::Move($tmp, $Path)
+        }
+    }
+    finally {
+        foreach ($leftover in @($tmp, $backup)) {
+            if (Test-Path -LiteralPath $leftover) {
+                Remove-Item -LiteralPath $leftover -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
 }
 
 function Read-TodoFile {
@@ -209,12 +273,12 @@ function Write-TodoFile {
         }
     }
 
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    $directory = [System.IO.Path]::GetDirectoryName($Path)
-    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
-        [void](New-Item -ItemType Directory -Path $directory -Force)
+    if ($out.Count -gt 0) {
+        Write-TodoText -Path $Path -Text (($out -join "`n") + "`n")
     }
-    [System.IO.File]::WriteAllLines($Path, [string[]]$out, $encoding)
+    else {
+        Write-TodoText -Path $Path -Text ''
+    }
 }
 
 function Get-TodoItem {
@@ -273,8 +337,7 @@ try {
                 Write-Output "已存在: $path"
             }
             else {
-                $encoding = New-Object System.Text.UTF8Encoding($false)
-                [System.IO.File]::WriteAllLines($path, [string[]]$Template, $encoding)
+                Write-TodoText -Path $path -Text (($Template -join "`n") + "`n")
                 Write-Output "已建立: $path"
             }
         }
