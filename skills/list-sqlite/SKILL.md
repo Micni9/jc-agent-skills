@@ -41,6 +41,7 @@ python scripts/view.py [list] ...       # read-only viewer, always ordered by li
 | `renumber` | compact numbers to 1..n, order preserved |
 | `field-add` / `field-list` / `field-update` / `field-remove` | per-list custom fields, see "Custom (sparse) fields" below; set values with `add`/`update --set name=value` |
 | `drop-list` | delete a whole list |
+| `backup` / `restore` | `lists.py backup <dest> [--force]`, `lists.py restore <file> [--force]`, see "Backup and recovery" below |
 | `path` / `init` | print resolved DB path / create DB |
 
 Viewer:
@@ -74,6 +75,29 @@ lists.py field-remove todo owner                           # also deletes its va
 
 Values are validated against the field type (`int`, `real`, `bool` = true/false/yes/no/1/0, `date` = YYYY-MM-DD); a bad value or an undefined field aborts the whole command with nothing written. `list`/`view.py`/`show` print set fields; `--json` returns them under `"fields"`. Prefer custom fields over the free-form `extra` column. DBs created before this feature get the two tables on the next write; read-only commands work on old DBs unchanged.
 
+## Backup and recovery
+
+`.ai/lists.db` is usually git-ignored, so it may be the only copy of the data. Back it up outside the repo.
+
+```bash
+lists.py backup ~/backups/lists-2026-11-18.db            # consistent copy of the resolved DB
+lists.py backup ~/backups/lists-latest.db --force        # replace an existing backup file
+lists.py restore ~/backups/lists-2026-11-18.db           # target DB missing -> restored
+lists.py restore ~/backups/lists-2026-11-18.db --force   # target DB exists -> replaced (see below)
+lists.py --db other.db backup ...                        # --db / LIST_DB apply as everywhere else
+```
+
+Behaviour:
+
+- `backup` uses the SQLite online backup API from a read-only connection, so it is safe while another process has the DB open (it captures committed data only, never a half-written file). It writes `<dest>.tmp`, runs `PRAGMA integrity_check` on it and only then renames it to `<dest>`; a failed backup leaves any existing destination untouched and no `.tmp` behind.
+- `backup` refuses a missing source DB (it never creates one), a destination equal to the source, and an existing destination unless `--force`.
+- `restore` validates the source first (opens, `integrity_check`, `lists`/`items` tables present, no foreign-key violations). If validation fails nothing is touched.
+- `restore` refuses to replace an existing DB without `--force`. With `--force` it first saves the current DB as `<db>.pre-restore-<timestamp>.bak` (next to the DB), then copies the backup in through the backup API and applies additive schema migrations, so a backup made by an older version of the skill still works.
+- Lists, item numbers/order/status/timestamps and custom field definitions and values are all preserved (the whole DB file content is copied).
+- Only pass `--force` to `restore` when the user asked to replace the current DB, and tell them where the `.pre-restore-*.bak` copy is.
+
+Cadence: back up before risky operations (`drop-list`, `restore --force`, bulk `remove`/`renumber`, schema/skill upgrades) and at least weekly while the list is in active use, to a directory that is synced or on another disk, with a dated file name so older backups are kept. After a restore, verify with `lists.py lists` and `view.py <list> --status all`.
+
 ## Working rules
 
 1. One named list per concern (`todo`, `backlog`, `review-findings`, ...). Pick the name; reuse an existing one (`lists.py lists`) rather than creating near-duplicates.
@@ -94,8 +118,27 @@ When the user asks to switch a project over:
 4. Edit the project's agent-instructions TODO section (the same file rule 6 refers to) so it names this skill, the script path and the list name, and says the old store is retired; otherwise other agents keep writing to the old file. Preserve the file's existing line endings (CRLF is common on Windows).
 5. Only add `.ai/` to the repo `.gitignore` if the user asks (see above); `.ai/` may already be self-ignored by its own `.gitignore`.
 
+## Upgrading an existing DB after the skill changes
+
+Adjust the existing DB in place; do not rebuild it (a rebuild loses ids, timestamps and done history, and additive schema changes migrate themselves on the next write).
+
+1. `diff -ru --exclude=__pycache__` the project copy against the shared copy to see what changed; a whole-file diff is usually CRLF vs LF only, so read the real differences.
+2. Move data that was parked in the free-form `extra` column (e.g. legacy ID, discovery date) into custom fields: `field-add <list> <name> [--type ...]` once per field, then `update <list> <n> --set name=value ... --extra ""` per item, so nothing is left in two places.
+3. Verify with `show <list> <n>`, `field-list <list>` and `view.py <list> --status all`.
+
 ## Committing the skill itself
 
-`scripts/__pycache__/` appears after the first run and is not ignored by default. Stage the files explicitly (`README.md`, `SKILL.md`, `scripts/*.py`) instead of `git add skills/list-sqlite`, and never commit `.pyc` or the `.db`.
+`scripts/__pycache__/` appears after the first run and is not ignored by default. Stage the files explicitly (`README.md`, `SKILL.md`, `scripts/*.py`) instead of `git add skills/list-sqlite`, and never commit `.pyc` or the `.db`. Keep skill changes and the project's `AGENTS.md` TODO-rule change in separate commits. If asked to ignore `__pycache__`, add `__pycache__/` to the repo `.gitignore` and confirm with `git check-ignore -v`; commit `.gitignore` only when asked.
 
 If a copy of this skill already exists in the target `skills/` dir, `diff -rq --exclude=__pycache__ <src> <dst>` before copying; identical means nothing to do.
+
+## Changing the scripts or SKILL.md
+
+The skill lives in several copies: the source repo (`projects/jc-agent-skills/skills/list-sqlite`), `~/.agents/skills/list-sqlite` (shared, read by Hermes) and `~/.claude/skills/list-sqlite`. Other sessions edit them independently, so:
+
+1. `diff -rq --exclude=__pycache__` all copies BEFORE editing. If a copy has content the source lacks, merge it into the source first (a whole-file diff usually just means CRLF vs LF; compare with line endings normalized) - copying source over it would silently drop that work.
+2. Edit the source, then copy to the other two and re-run `diff -rq`; delete `__pycache__` afterwards (running a script from a copy recreates it).
+3. Schema changes must be additive: new tables go in `CREATE TABLE IF NOT EXISTS` inside `SCHEMA` so existing DBs migrate on the next write. Every read path (`view.py`, `list`, `show`, `field-list`) opens the DB `mode=ro` and cannot create tables, so guard queries on new tables with a `sqlite_master` check (`has_field_tables`) instead of assuming they exist.
+4. Multi-step writes (item row + custom-field values) run inside one `with con:` transaction so validation errors leave nothing behind and burn no list numbers.
+5. Smoke-test in a scratch git repo run from a SUBDIRECTORY (proves repo-root detection puts `.ai/` at the root), and keep an old-schema DB copy to prove read-only commands still work on it.
+6. For multi-line Python/file edits prefer `write_file`/`patch` over giant bash heredocs; a long heredoc with mixed quotes can abort the whole command with nothing written - check the file exists after a failed run.

@@ -418,6 +418,114 @@ def cmd_drop_list(a, db):
     print(f"Dropped list {a.list}")
 
 
+def _check_db_file(path, what):
+    """Open `path` read-only and verify it is a healthy list-sqlite DB. Exits with a message otherwise."""
+    path = Path(path)
+    if not path.is_file():
+        sys.exit(f"{what} not found: {path}")
+    try:
+        con = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+        try:
+            ok = con.execute("PRAGMA integrity_check").fetchall()
+            if ok != [("ok",)]:
+                sys.exit(f"{what} failed integrity_check: {path}: {ok[0][0]}")
+            names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if not {"lists", "items"} <= names:
+                sys.exit(f"{what} is not a list-sqlite database (missing lists/items tables): {path}")
+            if con.execute("PRAGMA foreign_key_check").fetchall():
+                sys.exit(f"{what} has foreign key violations: {path}")
+            n_lists = con.execute("SELECT COUNT(*) FROM lists").fetchone()[0]
+            n_items = con.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        finally:
+            con.close()
+    except sqlite3.DatabaseError as e:
+        sys.exit(f"{what} is not a valid SQLite database: {path}: {e}")
+    return n_lists, n_items
+
+
+def _same_file(a, b):
+    a, b = Path(a), Path(b)
+    try:
+        return a.exists() and b.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
+def cmd_backup(a, db):
+    """Consistent copy via the SQLite backup API (safe while the DB is open elsewhere)."""
+    db = Path(db)
+    dest = Path(a.dest).expanduser().resolve()
+    if not db.is_file():
+        sys.exit(f"DB not found: {db} (nothing to back up)")
+    if _same_file(db, dest) or dest == db:
+        sys.exit("Backup destination is the source database itself.")
+    if dest.exists() and not a.force:
+        sys.exit(f"Destination exists: {dest}. Refusing to overwrite; pass --force to replace it.")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.exists():
+        tmp.unlink()
+    src = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+    try:
+        out = sqlite3.connect(tmp)
+        try:
+            src.backup(out)
+        finally:
+            out.close()
+    except BaseException:
+        src.close()
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    src.close()
+    try:
+        n_lists, n_items = _check_db_file(tmp, "Backup")  # verify before it replaces anything
+    except SystemExit:
+        if tmp.exists():
+            tmp.unlink()
+        raise
+    os.replace(tmp, dest)  # only now does the destination change
+    print(f"Backup written: {dest} ({n_lists} list(s), {n_items} item(s))")
+
+
+def cmd_restore(a, db):
+    """Replace the configured DB with a validated backup (keeps a safety copy of the current DB)."""
+    db = Path(db)
+    srcp = Path(a.source).expanduser().resolve()
+    if _same_file(srcp, db) or srcp == db:
+        sys.exit("Restore source is the target database itself.")
+    n_lists, n_items = _check_db_file(srcp, "Restore source")  # validate BEFORE touching the target
+    safety = None
+    if db.exists():
+        if not a.force:
+            sys.exit(f"Target DB exists: {db}. Refusing to overwrite; pass --force "
+                     f"(the current DB is first saved as <db>.pre-restore-<timestamp>.bak).")
+        safety = db.with_name(f"{db.name}.pre-restore-{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak")
+        cur = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
+        try:
+            bak = sqlite3.connect(safety)
+            try:
+                cur.backup(bak)
+            finally:
+                bak.close()
+        finally:
+            cur.close()
+    db.parent.mkdir(parents=True, exist_ok=True)
+    # Copy INTO the target through the backup API (one atomic write transaction), not by swapping files,
+    # so a reader/writer holding the DB open never sees a half-written file.
+    src = sqlite3.connect(f"file:{srcp.as_posix()}?mode=ro", uri=True)
+    dst = sqlite3.connect(db)
+    try:
+        src.backup(dst)
+    finally:
+        src.close()
+        dst.close()
+    connect(db).close()  # apply additive schema migrations to an older backup
+    print(f"Restored {db} from {srcp} ({n_lists} list(s), {n_items} item(s))")
+    if safety:
+        print(f"Previous DB saved as: {safety}")
+
+
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--db", help="DB file path (default: <repo root>/.ai/lists.db)")
@@ -476,6 +584,12 @@ def build_parser():
     s = mk("field-remove", cmd_field_remove, "delete a field and all its values")
     s.add_argument("name")
     mk("drop-list", cmd_drop_list, "delete a whole list")
+    s = mk("backup", cmd_backup, "write a consistent backup of the DB to DEST", list_=False)
+    s.add_argument("dest", help="backup file path")
+    s.add_argument("--force", action="store_true", help="overwrite DEST if it exists")
+    s = mk("restore", cmd_restore, "replace the DB with a validated backup file", list_=False)
+    s.add_argument("source", help="backup file to restore from")
+    s.add_argument("--force", action="store_true", help="overwrite the existing DB (a .pre-restore-*.bak copy is kept)")
     return p
 
 
