@@ -18,3 +18,11 @@ python scripts/view.py todo
 DB path: `--db <file>` > env `LIST_DB` > `<repo root>/.ai/lists.db` (repo root = nearest `.git` ancestor, else cwd).
 
 Requires Python 3.8+ (stdlib `sqlite3`); no other dependencies.
+
+Per-list custom fields (sparse EAV tables `list_fields` + `item_field_values`):
+
+```bash
+python scripts/lists.py field-add todo severity --type int
+python scripts/lists.py add todo "Fix NPE" --set severity=4
+python scripts/view.py todo
+```

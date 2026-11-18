@@ -38,7 +38,29 @@ CREATE TABLE IF NOT EXISTS items (
   UNIQUE (list_id, number)
 );
 CREATE INDEX IF NOT EXISTS idx_items_list_number ON items(list_id, number);
+
+-- Per-list custom (sparse) field definitions.
+CREATE TABLE IF NOT EXISTS list_fields (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  list_id     INTEGER NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+  name        TEXT NOT NULL,
+  type        TEXT NOT NULL DEFAULT 'text' CHECK (type IN ('text','int','real','bool','date')),
+  description TEXT,
+  created_at  TEXT NOT NULL,
+  UNIQUE (list_id, name)
+);
+-- Sparse values: one row per (item, field) that is actually set.
+-- `value` has no declared type on purpose: ints/reals stay numeric, so ORDER BY / comparisons work.
+CREATE TABLE IF NOT EXISTS item_field_values (
+  item_id  INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  field_id INTEGER NOT NULL REFERENCES list_fields(id) ON DELETE CASCADE,
+  value,
+  PRIMARY KEY (item_id, field_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ifv_field ON item_field_values(field_id);
 """
+
+FIELD_TYPES = ("text", "int", "real", "bool", "date")
 
 
 def now():
@@ -103,12 +125,83 @@ def fetch_items(con, lst, status="open", priority=None):
     return con.execute(q + " ORDER BY number", a).fetchall()
 
 
-def fmt_item(r):
+def has_field_tables(con):
+    n = con.execute("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('list_fields','item_field_values')").fetchone()[0]
+    return n == 2
+
+
+def coerce(ftype, raw, fname=""):
+    """Validate/normalize a CLI string for a field type."""
+    try:
+        if ftype == "int":
+            return int(raw)
+        if ftype == "real":
+            return float(raw)
+        if ftype == "bool":
+            v = str(raw).strip().lower()
+            if v in ("1", "true", "yes", "y"):
+                return 1
+            if v in ("0", "false", "no", "n"):
+                return 0
+            raise ValueError
+        if ftype == "date":
+            return datetime.strptime(str(raw).strip(), "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        sys.exit(f"Field '{fname}' expects {ftype}, got: {raw!r}")
+    return str(raw)
+
+
+def get_field(con, lst, name):
+    row = con.execute("SELECT * FROM list_fields WHERE list_id=? AND name=?", (lst["id"], name)).fetchone()
+    if not row:
+        sys.exit(f"Field '{name}' not defined for list '{lst['name']}'. "
+                 f"Define it: field-add {lst['name']} {name} [--type text|int|real|bool|date] "
+                 f"(or pass --auto-field to create it as text).")
+    return row
+
+
+def apply_sets(con, lst, item_id, sets, unsets=(), auto_field=False):
+    """sets: ['name=value', ...]; unsets: ['name', ...]. Writes sparse rows (no row = unset)."""
+    for s in sets or ():
+        if "=" not in s:
+            sys.exit(f"--set expects name=value, got: {s!r}")
+        name, raw = s.split("=", 1)
+        name = name.strip()
+        row = con.execute("SELECT * FROM list_fields WHERE list_id=? AND name=?", (lst["id"], name)).fetchone()
+        if not row and auto_field:
+            con.execute("INSERT INTO list_fields(list_id,name,type,created_at) VALUES(?,?,?,?)",
+                        (lst["id"], name, "text", now()))
+            row = con.execute("SELECT * FROM list_fields WHERE list_id=? AND name=?", (lst["id"], name)).fetchone()
+        if not row:
+            row = get_field(con, lst, name)  # exits with hint
+        con.execute("INSERT OR REPLACE INTO item_field_values(item_id,field_id,value) VALUES(?,?,?)",
+                    (item_id, row["id"], coerce(row["type"], raw, name)))
+    for name in unsets or ():
+        row = get_field(con, lst, name.strip())
+        con.execute("DELETE FROM item_field_values WHERE item_id=? AND field_id=?", (item_id, row["id"]))
+
+
+def load_values(con, item_ids):
+    """{item_id: {field_name: value}} for the given items (sparse; only set fields)."""
+    out = {i: {} for i in item_ids}
+    if not item_ids or not has_field_tables(con):
+        return out
+    marks = ",".join("?" * len(item_ids))
+    q = ("SELECT v.item_id, f.name, f.type, v.value FROM item_field_values v "
+         "JOIN list_fields f ON f.id=v.field_id WHERE v.item_id IN (%s) ORDER BY f.id" % marks)
+    for r in con.execute(q, list(item_ids)):
+        out[r["item_id"]][r["name"]] = bool(r["value"]) if r["type"] == "bool" else r["value"]
+    return out
+
+
+def fmt_item(r, fields=None):
     box = "[x]" if r["status"] == "done" else "[ ]"
     pri = f" [{r['priority']}]" if r["priority"] else ""
     s = f"{r['number']:>3}. {box}{pri} {r['title']}"
     if r["location"]:
         s += f"  ({r['location']})"
+    if fields:
+        s += "\n       " + "  ".join(f"{k}={str(v).lower() if isinstance(v, bool) else v}" for k, v in fields.items())
     if r["note"]:
         s += "\n       " + r["note"].replace("\n", "\n       ")
     return s
@@ -116,13 +209,19 @@ def fmt_item(r):
 
 def print_list(con, lst, status="open", priority=None, as_json=False):
     rows = fetch_items(con, lst, status, priority)
+    vals = load_values(con, [r["id"] for r in rows])
     if as_json:
-        return [{"list": lst["name"], **{k: r[k] for k in r.keys() if k not in ("id", "list_id")}} for r in rows]
+        out = []
+        for r in rows:
+            d = {"list": lst["name"], **{k: r[k] for k in r.keys() if k not in ("id", "list_id")}}
+            d["fields"] = vals[r["id"]]
+            out.append(d)
+        return out
     print(f"# {lst['name']}" + (f" - {lst['description']}" if lst["description"] else ""))
     if not rows:
         print("(empty)")
     for r in rows:
-        print(fmt_item(r))
+        print(fmt_item(r, vals[r["id"]]))
     return None
 
 
@@ -164,6 +263,8 @@ def cmd_add(a, db):
             "INSERT INTO items(list_id,number,title,priority,location,note,extra,created_at,updated_at) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (lst["id"], num, a.title, a.priority, a.location, a.note, a.extra, t, t))
+        item_id = con.execute("SELECT id FROM items WHERE list_id=? AND number=?", (lst["id"], num)).fetchone()[0]
+        apply_sets(con, lst, item_id, a.set, auto_field=a.auto_field)  # error -> whole add rolls back
     print(f"Added {a.list} #{num}: {a.title}")
 
 
@@ -189,6 +290,8 @@ def cmd_show(a, db):
     for k in r.keys():
         if k not in ("id", "list_id") and r[k] is not None:
             print(f"{k}: {r[k]}")
+    for k, v in load_values(con, [r["id"]])[r["id"]].items():
+        print(f"field.{k}: {str(v).lower() if isinstance(v, bool) else v}")
 
 
 def cmd_update(a, db):
@@ -198,10 +301,11 @@ def cmd_update(a, db):
         r = get_item(con, lst, a.number)
         sets = {k: v for k, v in (("title", a.title), ("priority", a.priority), ("location", a.location),
                                    ("note", a.note), ("extra", a.extra)) if v is not None}
-        if not sets:
+        if not sets and not a.set and not a.unset:
             sys.exit("Nothing to update.")
         sets["updated_at"] = now()
         con.execute(f"UPDATE items SET {','.join(k + '=?' for k in sets)} WHERE id=?", [*sets.values(), r["id"]])
+        apply_sets(con, lst, r["id"], a.set, a.unset, a.auto_field)
     print(f"Updated {a.list} #{a.number}")
 
 
@@ -254,6 +358,58 @@ def cmd_renumber(a, db):
     print(f"Renumbered {a.list}")
 
 
+def cmd_field_add(a, db):
+    con = connect(db)
+    with con:
+        lst = get_list(con, a.list)
+        if con.execute("SELECT 1 FROM list_fields WHERE list_id=? AND name=?", (lst["id"], a.name)).fetchone():
+            sys.exit(f"Field '{a.name}' already exists in '{a.list}'.")
+        con.execute("INSERT INTO list_fields(list_id,name,type,description,created_at) VALUES(?,?,?,?,?)",
+                    (lst["id"], a.name, a.type, a.desc, now()))
+    print(f"Defined field {a.list}.{a.name} ({a.type})")
+
+
+def cmd_field_list(a, db):
+    con = connect(db, readonly=True)
+    lst = get_list(con, a.list)
+    if not has_field_tables(con):
+        return
+    q = ("SELECT f.*, (SELECT COUNT(*) FROM item_field_values v WHERE v.field_id=f.id) AS used "
+         "FROM list_fields f WHERE f.list_id=? ORDER BY f.id")
+    for f in con.execute(q, (lst["id"],)):
+        print(f"{f['name']}\t{f['type']}\tused={f['used']}\t{f['description'] or ''}")
+
+
+def cmd_field_update(a, db):
+    con = connect(db)
+    with con:
+        lst = get_list(con, a.list)
+        f = get_field(con, lst, a.name)
+        if a.rename:
+            if con.execute("SELECT 1 FROM list_fields WHERE list_id=? AND name=?", (lst["id"], a.rename)).fetchone():
+                sys.exit(f"Field '{a.rename}' already exists.")
+            con.execute("UPDATE list_fields SET name=? WHERE id=?", (a.rename, f["id"]))
+        if a.desc is not None:
+            con.execute("UPDATE list_fields SET description=? WHERE id=?", (a.desc, f["id"]))
+        if a.type and a.type != f["type"]:
+            n = con.execute("SELECT COUNT(*) FROM item_field_values WHERE field_id=?", (f["id"],)).fetchone()[0]
+            if n:
+                sys.exit(f"Field '{a.name}' has {n} value(s); type change refused. "
+                         f"Create a new field, copy values, then field-remove the old one.")
+            con.execute("UPDATE list_fields SET type=? WHERE id=?", (a.type, f["id"]))
+    print(f"Updated field {a.list}.{a.name}")
+
+
+def cmd_field_remove(a, db):
+    con = connect(db)
+    with con:
+        lst = get_list(con, a.list)
+        f = get_field(con, lst, a.name)
+        n = con.execute("SELECT COUNT(*) FROM item_field_values WHERE field_id=?", (f["id"],)).fetchone()[0]
+        con.execute("DELETE FROM list_fields WHERE id=?", (f["id"],))  # values cascade
+    print(f"Removed field {a.list}.{a.name} (and {n} value(s))")
+
+
 def cmd_drop_list(a, db):
     con = connect(db)
     with con:
@@ -286,6 +442,8 @@ def build_parser():
     s.add_argument("--extra", help="free-form / JSON text")
     s.add_argument("--number", type=int, help="explicit number (default: max+1)")
     s.add_argument("--list-desc", help="description used if the list is created")
+    s.add_argument("--set", action="append", metavar="FIELD=VALUE", help="custom field value (repeatable)")
+    s.add_argument("--auto-field", action="store_true", help="auto-define unknown --set fields as text")
     s = mk("list", cmd_list, "list items ordered by number")
     s.add_argument("--status", choices=["open", "done", "all"], default="open")
     s.add_argument("--priority")
@@ -295,6 +453,9 @@ def build_parser():
     s = mk("update", cmd_update, "update fields", number=True)
     for f in ("title", "priority", "location", "note", "extra"):
         s.add_argument("--" + f)
+    s.add_argument("--set", action="append", metavar="FIELD=VALUE", help="set custom field (repeatable)")
+    s.add_argument("--unset", action="append", metavar="FIELD", help="clear custom field (repeatable)")
+    s.add_argument("--auto-field", action="store_true", help="auto-define unknown --set fields as text")
     mk("done", cmd_done, "mark done", number=True)
     mk("reopen", cmd_reopen, "mark open", number=True)
     s = mk("remove", cmd_remove, "delete item (number gap kept unless --renumber)", number=True)
@@ -302,6 +463,18 @@ def build_parser():
     s = mk("move", cmd_move, "move item to position N, shifting others", number=True)
     s.add_argument("--to", type=int, required=True)
     mk("renumber", cmd_renumber, "compact numbers to 1..n keeping order")
+    s = mk("field-add", cmd_field_add, "define a custom field for a list")
+    s.add_argument("name")
+    s.add_argument("--type", choices=FIELD_TYPES, default="text")
+    s.add_argument("--desc")
+    mk("field-list", cmd_field_list, "list a list's custom fields")
+    s = mk("field-update", cmd_field_update, "rename / re-describe a field (type only if unused)")
+    s.add_argument("name")
+    s.add_argument("--rename")
+    s.add_argument("--desc")
+    s.add_argument("--type", choices=FIELD_TYPES)
+    s = mk("field-remove", cmd_field_remove, "delete a field and all its values")
+    s.add_argument("name")
     mk("drop-list", cmd_drop_list, "delete a whole list")
     return p
 
